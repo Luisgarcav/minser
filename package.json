@@ -1,0 +1,30 @@
+{
+  "name": "minser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Consulta términos mientras lees, sin salir al navegador.",
+  "scripts": {
+    "dev": "bun src/index.tsx",
+    "start": "bun src/index.tsx",
+    "demo": "bun src/index.tsx --demo",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "bun run typecheck && bun test && bun run format:check"
+  },
+  "engines": {
+    "bun": ">=1.4.1"
+  },
+  "dependencies": {
+    "@opentui/core": "0.5.12",
+    "@opentui/solid": "0.5.12",
+    "solid-js": "1.9.12"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "prettier": "3.9.9",
+    "typescript": "7.0.2"
+  }
+}
