@@ -71,6 +71,55 @@ describe("parseArgs", () => {
     });
   });
 
+  test.each(["low", "medium", "high"] as const)(
+    "parses --effort %s before or after the query",
+    (effort) => {
+      expect(parseArgs(["--effort", effort, "perceptron"])).toMatchObject({
+        effort,
+        query: "perceptron",
+      });
+      expect(
+        parseArgs(["perceptron", "--effort", effort, "--context", "ML"]),
+      ).toMatchObject({
+        effort,
+        query: "perceptron",
+        context: "ML",
+      });
+      expect(HELP).toContain("--effort LEVEL");
+      expect(HELP).toContain("PARALLEL_EFFORT");
+    },
+  );
+
+  test("help explains explicit follow-ups, independent lookups, costs and provider storage", () => {
+    for (const detail of [
+      "f follow up",
+      "n new lookup",
+      "Neither sends until Enter",
+      "Each uncached follow-up is a new paid lookup",
+      "Zero Data Retention",
+      "Parallel stores responses server-side",
+      "including f/n/q",
+    ])
+      expect(HELP).toContain(detail);
+  });
+
+  test("omitted effort can be resolved from the environment later", () => {
+    expect(parseArgs([]).effort).toBeUndefined();
+    expect(parseArgs(["--", "--effort", "high"]).query).toBe("--effort high");
+    expect(parseArgs(["--", "--effort", "high"]).effort).toBeUndefined();
+  });
+
+  test.each([
+    { args: ["--effort"] },
+    { args: ["--effort", ""] },
+    { args: ["--effort", " "] },
+    { args: ["--effort", "--demo"] },
+    { args: ["--effort", "--"] },
+    { args: ["--effort", "invalid"] },
+  ])("rejects missing or invalid effort: %j", ({ args }) => {
+    expect(() => parseArgs([...args])).toThrow("effort");
+  });
+
   test.each(["--unknown", "-x"])("rejects unknown option %s", (flag) => {
     expect(() => parseArgs(["consulta", flag])).toThrow("Unknown option");
   });

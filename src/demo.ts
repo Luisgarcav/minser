@@ -23,9 +23,18 @@ const example: Answer = {
 
 /** Local illustrative text, never presented as downloaded source quotations. */
 export function createDemoService(): LookupService {
+  let nextId = 0;
   return {
-    async search() {
-      return structuredClone(example);
+    async search(_term, _context, _signal, _effort, previousResponseId) {
+      return {
+        ...structuredClone(example),
+        responseId: `demo-response-${++nextId}`,
+        ...(previousResponseId
+          ? {
+              text: "For a fair coin, either outcome has probability one half, so its entropy is one bit.¹ If the outcome is certain, its entropy is zero: there is no uncertainty left to resolve.²",
+            }
+          : {}),
+      };
     },
     async extract(source) {
       return {

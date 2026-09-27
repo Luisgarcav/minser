@@ -1,4 +1,5 @@
 import { HELP, parseArgs } from "./cli";
+import { resolveEffort } from "./effort";
 
 async function main() {
   const options = parseArgs(Bun.argv.slice(2));
@@ -6,6 +7,10 @@ async function main() {
     console.log(HELP);
     return;
   }
+  const effort = resolveEffort(
+    options.effort,
+    options.demo ? undefined : process.env.PARALLEL_EFFORT,
+  );
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error(
       "minser needs an interactive terminal. Use --help to see available options.",
@@ -28,13 +33,14 @@ async function main() {
   const apiKey = process.env.PARALLEL_API_KEY?.trim() ?? "";
   const service = options.demo
     ? createDemoService()
-    : createParallelService(apiKey);
+    : createParallelService(apiKey, { effort });
   await render(
     () => (
       <App
         service={service}
         demo={options.demo}
         configured={Boolean(apiKey)}
+        effort={effort}
         initialQuery={options.query}
         initialContext={options.context}
       />

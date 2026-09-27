@@ -57,6 +57,29 @@ describe("Paper terminal flow", () => {
     expect(api.extract).not.toHaveBeenCalled();
   });
 
+  test.each([
+    ["low", "5–10"],
+    ["medium", "15–20"],
+    ["high", "30–60"],
+  ] as const)(
+    "shows %s effort and its waiting estimate",
+    async (effort, seconds) => {
+      const api = service();
+      api.search.mockReturnValueOnce(new Promise(() => {}));
+      const screen = await mount({
+        service: api,
+        configured: true,
+        initialQuery: "perceptron",
+        effort,
+      });
+      expect(screen.captureCharFrame()).toContain(`effort: ${effort}`);
+      expect(api.search).not.toHaveBeenCalled();
+      screen.mockInput.pressEnter();
+      await screen.waitForFrame((frame) => frame.includes("Looking up"));
+      expect(screen.captureCharFrame()).toContain(`${seconds} seconds`);
+    },
+  );
+
   test("single-field lookup, numbered citations, collapse and cached re-expansion", async () => {
     const api = service();
     const screen = await mount({ service: api, configured: true });
@@ -66,6 +89,7 @@ describe("Paper terminal flow", () => {
       "entropy",
       "information theory",
       expect.any(AbortSignal),
+      "low",
     );
     expect(api.extract).not.toHaveBeenCalled();
     const frame = screen.captureCharFrame();

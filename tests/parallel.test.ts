@@ -121,6 +121,139 @@ const answer = {
   sources: [{ ...SOURCE, excerpts: [] }],
 };
 
+describe("reasoning effort", () => {
+  test("per-lookup effort changes the body and deadline without changing the default", async () => {
+    const timer = deadline();
+    const fetcher = mock<FetchHandler>(async () => json(responsePayload()));
+    const service = createParallelService(KEY, {
+      fetch: fetcher as unknown as typeof fetch,
+      effort: "medium",
+    });
+    await service.search("term", "", undefined, "low");
+    await service.search("term", "", undefined, "high");
+    await service.search("term", "");
+    expect(
+      fetcher.mock.calls.map(
+        ([, init]) => JSON.parse(String(init?.body)).reasoning.effort,
+      ),
+    ).toEqual(["low", "high", "medium"]);
+    expect(timer.schedule.mock.calls.map(([, ms]) => ms)).toEqual([
+      30_000, 120_000, 60_000,
+    ]);
+  });
+
+  test("per-lookup effort still honors an explicit timeout", async () => {
+    const timer = deadline();
+    const { service } = setup(async () => json(responsePayload()), 321);
+    await service.search("term", "", undefined, "high");
+    expect(timer.schedule).toHaveBeenCalledWith(expect.any(Function), 321);
+  });
+
+  test("invalid per-lookup effort fails safely before fetch", async () => {
+    const { service, fetcher } = setup(async () => json(responsePayload()));
+    const error = await rejection(
+      service.search("term", "", undefined, PRIVATE_BODY as "low"),
+    );
+    expect(error.message).toContain("Effort must be");
+    expectPrivate(error);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  test("rejects invalid runtime effort without requests or exposing its value", () => {
+    const fetcher = mock<FetchHandler>(async () => json(responsePayload()));
+    expect(() =>
+      createParallelService(KEY, {
+        fetch: fetcher as unknown as typeof fetch,
+        effort: PRIVATE_BODY as "low",
+      }),
+    ).toThrow(
+      "Effort must be low, medium or high (--effort / PARALLEL_EFFORT).",
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["low", 30_000],
+    ["medium", 60_000],
+    ["high", 120_000],
+  ] as const)(
+    "sends %s effort with a %i ms search timeout",
+    async (effort, timeoutMs) => {
+      const timer = deadline();
+      const fetcher = mock<FetchHandler>(async () => json(responsePayload()));
+      const service = createParallelService(KEY, {
+        fetch: fetcher as unknown as typeof fetch,
+        effort,
+      });
+      expect(await service.search("perceptron", "")).toEqual(answer);
+      expect(
+        JSON.parse(String(fetcher.mock.calls[0]![1]?.body)).reasoning,
+      ).toEqual({ effort });
+      expect(timer.schedule).toHaveBeenCalledWith(
+        expect.any(Function),
+        timeoutMs,
+      );
+      expect(timer.clear).toHaveBeenCalledWith(timer.handle);
+    },
+  );
+
+  test.each(["low", "medium", "high"] as const)(
+    "%s does not change Extract's timeout or request body",
+    async (effort) => {
+      const timer = deadline();
+      const fetcher = mock<FetchHandler>(async () =>
+        json({ results: [SOURCE] }),
+      );
+      const service = createParallelService(KEY, {
+        fetch: fetcher as unknown as typeof fetch,
+        effort,
+      });
+      expect(await service.extract(SOURCE, "term", "")).toEqual(SOURCE);
+      expect(timer.schedule).toHaveBeenCalledWith(expect.any(Function), 30_000);
+      expect(
+        JSON.parse(String(fetcher.mock.calls[0]![1]?.body)).reasoning,
+      ).toBeUndefined();
+    },
+  );
+
+  test("high effort times out with the correct duration and aborts fetch", async () => {
+    const timer = deadline();
+    const fetcher = mock(
+      (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Promise<Response>(() => {}),
+    );
+    const service = createParallelService(KEY, {
+      fetch: fetcher as unknown as typeof fetch,
+      effort: "high",
+    });
+    const promise = service.search("term", "");
+    timer.fire();
+    const error = await rejection(promise);
+    expect(error.name).toBe("TimeoutError");
+    expect(error.message).toBe("Parallel did not respond within 120 seconds.");
+    expect(fetcher.mock.calls[0]![1]?.signal?.aborted).toBe(true);
+  });
+
+  test.each(OPERATIONS)(
+    "an explicit timeout overrides the %s default even on high effort",
+    async (operation) => {
+      const timer = deadline();
+      const fetcher = mock<FetchHandler>(async () =>
+        json(
+          operation === "search" ? responsePayload() : { results: [SOURCE] },
+        ),
+      );
+      const service = createParallelService(KEY, {
+        fetch: fetcher as unknown as typeof fetch,
+        effort: "high",
+        timeoutMs: 321,
+      });
+      await lookup(service, operation);
+      expect(timer.schedule).toHaveBeenCalledWith(expect.any(Function), 321);
+    },
+  );
+});
+
 describe("Responses and Extract contracts", () => {
   test("Responses requests a short cited answer, with no search or conversation calls", async () => {
     const { service, fetcher } = setup(async () => json(responsePayload()));
@@ -288,7 +421,75 @@ describe("citation parsing", () => {
       });
     }
   });
-  test.each([-1, 0, 99, 1.5, null])(
+  test.each([0, 7, 14])(
+    "keeps zero-width citations at %i as sources without inventing inline spans",
+    async (position) => {
+      const { service } = setup(async () =>
+        json(
+          responsePayload("First. Second.", [
+            cite(position, SOURCE.url, position),
+            cite(14, "https://example.org/second", 7),
+          ]),
+        ),
+      );
+      const result = await service.search("perceptron", "");
+      expect(result.text).toBe("First. Second.²");
+      expect(result.sources).toEqual([
+        { url: SOURCE.url, title: "Source", excerpts: [] },
+        { url: "https://example.org/second", title: "Source", excerpts: [] },
+      ]);
+    },
+  );
+  test("retains an answer whose only citation has no span", async () => {
+    const { service } = setup(async () =>
+      json(responsePayload("A definition.", [cite(0)])),
+    );
+    expect(await service.search("perceptron", "")).toEqual({
+      text: "A definition.",
+      sources: [{ url: SOURCE.url, title: "Source", excerpts: [] }],
+    });
+  });
+  test("deduplicates unpositioned sources and still renders their valid spans", async () => {
+    const { service } = setup(async () =>
+      json(responsePayload("First. Second.", [cite(0), cite(6), cite(0)])),
+    );
+    const result = await service.search("perceptron", "");
+    expect(result.text).toBe("First.¹ Second.");
+    expect(result.sources).toHaveLength(1);
+  });
+  test.each([-1, 99, 1.5, null])(
+    "still rejects invalid zero-width citation positions: %j",
+    async (position) => {
+      const { service } = setup(async () =>
+        json(
+          responsePayload("text", [
+            { ...cite(0), start_index: position, end_index: position },
+          ]),
+        ),
+      );
+      await expect(service.search("term", "")).rejects.toThrow(
+        "invalid response format",
+      );
+    },
+  );
+  test("filters unsafe URLs even on zero-width citations", async () => {
+    const { service } = setup(async () =>
+      json(responsePayload("Answer.", [cite(0, "http://127.0.0.1/")])),
+    );
+    expect(await service.search("term", "")).toEqual({
+      text: "Answer.",
+      sources: [],
+    });
+  });
+  test("rejects reversed citation spans", async () => {
+    const { service } = setup(async () =>
+      json(responsePayload("text", [cite(2, SOURCE.url, 3)])),
+    );
+    await expect(service.search("term", "")).rejects.toThrow(
+      "invalid response format",
+    );
+  });
+  test.each([-1, 99, 1.5, null])(
     "rejects invalid citation ends: %j",
     async (end) => {
       const { service } = setup(async () =>

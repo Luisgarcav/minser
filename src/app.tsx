@@ -12,9 +12,10 @@ import {
   onCleanup,
   Show,
 } from "solid-js";
-import type { LookupService } from "./parallel";
+import { EFFORT_LEVELS, EFFORT_PROFILES, type Effort } from "./effort";
+import { boundedText, type LookupService } from "./parallel";
 import { formatQuery, parseQuery } from "./query";
-import { LookupSession } from "./session";
+import { LookupSession, type Entry } from "./session";
 import { displayHost } from "./text";
 
 // Paper's layout with native terminal colors and transparent surfaces.
@@ -32,6 +33,7 @@ export type AppProps = {
   service: LookupService;
   demo?: boolean;
   configured?: boolean;
+  effort?: Effort;
   initialQuery?: string;
   initialContext?: string;
   onExit?: () => void;
@@ -40,24 +42,38 @@ export type AppProps = {
 export function App(props: AppProps) {
   const renderer = useRenderer();
   const dimensions = useTerminalDimensions();
-  const session = new LookupSession(props.service);
+  const session = new LookupSession(props.service, props.effort);
   const [state, setState] = createSignal(session.state);
+  const [choosingEffort, setChoosingEffort] = createSignal(false);
+  const [pendingEffort, setPendingEffort] = createSignal(session.state.effort);
   const [query, setQuery] = createSignal(
     formatQuery(props.initialQuery ?? "", props.initialContext),
   );
   const [editing, setEditing] = createSignal(true);
+  const [draft, setDraft] = createSignal<"followUp" | "new" | null>(null);
   const [elapsed, setElapsed] = createSignal(0);
   let reader: ScrollBoxRenderable | undefined;
   let action = 0;
   const unsubscribe = session.subscribe(setState);
   const missingKey = () => !props.configured && !props.demo;
+  const effort = () => state().effort;
   const width = () => Math.max(1, Math.min(80, dimensions().width) - 4);
-  const parsed = createMemo(() => parseQuery(query()));
+  const parsed = createMemo(() => {
+    const followUp = state().followUp;
+    return followUp
+      ? { term: boundedText(query(), 1000), context: followUp.context }
+      : parseQuery(query());
+  });
   const sources = () => state().entry?.sources ?? [];
   const lookupError = () => state().errorKind === "search" && !editing();
   const showAnswer = () =>
     !lookupError() && state().busy !== "search" && !!state().entry;
   const hasAnswer = () => !!state().entry?.text.trim() && sources().length > 0;
+  const canFollowUp = () => hasAnswer() && !!state().entry?.responseId?.trim();
+  const entryQuery = (entry: Entry) =>
+    entry.previousResponseId
+      ? entry.term
+      : formatQuery(entry.term, entry.context);
 
   createEffect(() => {
     const busy = state().busy;
@@ -81,11 +97,38 @@ export function App(props: AppProps) {
     onCleanup(() => renderer.off("frame", reveal));
   });
 
+  function openEffort() {
+    if (missingKey() || state().busy) return;
+    setPendingEffort(effort());
+    setChoosingEffort(true);
+  }
+
+  function applyEffort(level = pendingEffort()) {
+    if (missingKey() || state().busy) return;
+    setChoosingEffort(false);
+    if (session.setEffort(level)) {
+      action++;
+      setEditing(true);
+      reader?.scrollTo(0);
+    }
+  }
+
+  function moveEffort(direction: number) {
+    const index = EFFORT_LEVELS.indexOf(pendingEffort());
+    setPendingEffort(
+      EFFORT_LEVELS[
+        (index + direction + EFFORT_LEVELS.length) % EFFORT_LEVELS.length
+      ]!,
+    );
+  }
+
   async function submit() {
-    if (missingKey() || state().busy || !parsed().term) return;
+    if (choosingEffort() || missingKey() || state().busy || !parsed().term)
+      return;
     const current = ++action;
     const { term, context } = parsed();
-    setQuery(formatQuery(term, context));
+    setQuery(state().followUp ? term : formatQuery(term, context));
+    setDraft(null);
     setEditing(false);
     reader?.scrollTo(0);
     await session.search(term, context);
@@ -94,19 +137,56 @@ export function App(props: AppProps) {
 
   function edit() {
     action++;
+    setChoosingEffort(false);
     session.cancel();
+    setEditing(true);
+    reader?.scrollTo(0);
+  }
+
+  function followUp() {
+    if (missingKey() || choosingEffort() || !showAnswer()) return;
+    if (!session.startFollowUp()) return;
+    action++;
+    setDraft("followUp");
+    setQuery("");
+    setEditing(true);
+    reader?.scrollTo(0);
+  }
+
+  function newLookup() {
+    if (missingKey() || choosingEffort() || state().busy) return;
+    action++;
+    session.startNewLookup();
+    setDraft("new");
+    setQuery("");
     setEditing(true);
     reader?.scrollTo(0);
   }
 
   function previous() {
     action++;
-    const entry = session.back();
+    const entry = session.back(draft() !== null);
     if (entry) {
-      setQuery(formatQuery(entry.term, entry.context));
+      setDraft(null);
+      setQuery(entryQuery(entry));
       setEditing(false);
       reader?.scrollTo(0);
     }
+  }
+
+  function leaveOrCancel() {
+    action++;
+    const busy = state().busy;
+    if (!busy && editing() && draft()) {
+      const entry = session.back(true);
+      setDraft(null);
+      if (entry) setQuery(entryQuery(entry));
+      setEditing(false);
+    } else {
+      session.cancel();
+      setEditing(busy === "search" || (!state().entry && !editing()));
+    }
+    reader?.scrollTo(0);
   }
 
   function exit() {
@@ -128,17 +208,30 @@ export function App(props: AppProps) {
     if (key.ctrl && (key.name === "c" || key.name === "q")) {
       stop();
       exit();
+    } else if (key.ctrl && key.name === "e") {
+      stop();
+      if (choosingEffort()) setChoosingEffort(false);
+      else openEffort();
+    } else if (choosingEffort()) {
+      stop();
+      if (key.name === "escape") setChoosingEffort(false);
+      else if (key.name === "return") applyEffort();
+      else if (["up", "left"].includes(key.name)) moveEffort(-1);
+      else if (["down", "right"].includes(key.name)) moveEffort(1);
     } else if (key.ctrl && key.name === "b") {
       stop();
       previous();
     } else if (key.name === "escape") {
       stop();
-      action++;
-      const busy = state().busy;
-      session.cancel();
-      setEditing(busy === "search" || (!state().entry && !editing()));
+      leaveOrCancel();
     } else if (!key.ctrl && !key.meta && !editing()) {
-      if (key.name === "q") {
+      if (key.name === "f") {
+        stop();
+        followUp();
+      } else if (key.name === "n") {
+        stop();
+        newLookup();
+      } else if (key.name === "q") {
         stop();
         exit();
       } else if (key.name === "/" || key.name === "slash") {
@@ -173,15 +266,19 @@ export function App(props: AppProps) {
   });
 
   const footer = () => {
+    if (choosingEffort())
+      return "↑↓ choose · ⏎ apply · Esc cancel · Ctrl+C quit";
     if (missingKey()) return "q quit and configure · Ctrl+C quit";
     if (state().busy) return "Esc cancel · Ctrl+C quit";
-    if (editing()) return "⏎ look up · Esc leave editing · Ctrl+C quit";
-    if (state().error) return "⏎ retry · Ctrl+B previous · / edit · q quit";
-    if (!hasAnswer()) return "/ edit · Ctrl+B previous · q quit";
+    if (editing())
+      return `⏎ ${state().followUp ? "follow up" : "look up"} · Esc ${draft() ? "return" : "leave editing"} · Ctrl+C quit`;
+    if (state().error)
+      return "⏎ retry · n new · Ctrl+B previous · / edit · q quit";
+    if (!hasAnswer()) return "/ edit · n new · Ctrl+B previous · q quit";
     const open = state().openCitation;
     const expand =
       open === null ? `1–${sources().length} expand` : `${open + 1} collapse`;
-    return `${expand} · ↑↓ scroll · / edit · q quit`;
+    return `${expand}${canFollowUp() ? " · f follow up" : ""} · n new · ↑↓ scroll · / edit · q quit`;
   };
 
   return (
@@ -207,17 +304,28 @@ export function App(props: AppProps) {
           <text fg={color.ink}>
             <strong>minser</strong>
           </text>
-          <text fg={missingKey() || lookupError() ? color.rust : color.muted}>
-            {missingKey()
-              ? "no key"
-              : lookupError()
-                ? "no response"
-                : props.demo
-                  ? "demo · offline"
-                  : state().cached
-                    ? "session cache"
-                    : ""}
-          </text>
+          <box flexDirection="row" gap={2}>
+            <text fg={missingKey() || lookupError() ? color.rust : color.muted}>
+              {missingKey()
+                ? "no key"
+                : lookupError()
+                  ? "no response"
+                  : props.demo
+                    ? "demo · offline"
+                    : state().cached
+                      ? "session cache"
+                      : ""}
+            </text>
+            <Show when={!missingKey()}>
+              <text
+                id="effort-control"
+                fg={state().busy ? color.muted : color.patina}
+                onMouseDown={() => openEffort()}
+              >
+                {`effort: ${effort()}${state().busy ? "" : " · ^E"}`}
+              </text>
+            </Show>
+          </box>
         </box>
         <box height={1} flexShrink={0} />
         <Show
@@ -226,7 +334,9 @@ export function App(props: AppProps) {
             <text height={1} flexShrink={0} fg={color.ink}>
               <strong>{parsed().term}</strong>
               <span style={{ fg: color.muted }}>
-                {parsed().context ? ` : ${parsed().context}` : ""}
+                {!state().followUp && parsed().context
+                  ? ` : ${parsed().context}`
+                  : ""}
               </span>
             </text>
           }
@@ -240,13 +350,15 @@ export function App(props: AppProps) {
               value={query()}
               onInput={setQuery}
               onSubmit={() => void submit()}
-              focused={editing() && !missingKey() && !state().busy}
+              focused={
+                editing() && !choosingEffort() && !missingKey() && !state().busy
+              }
               onMouseDown={() => {
                 if (!missingKey()) edit();
               }}
-              maxLength={3003}
+              maxLength={state().followUp ? 1000 : 3003}
               flexGrow={1}
-              placeholder=""
+              placeholder={state().followUp ? "Ask a follow-up…" : ""}
               textColor={color.ink}
               cursorColor={color.patina}
               backgroundColor={color.ground}
@@ -257,7 +369,35 @@ export function App(props: AppProps) {
         <text height={1} flexShrink={0} fg={color.rule}>
           {"─".repeat(width())}
         </text>
-        <box height={1} flexShrink={0} />
+        <Show
+          when={state().followUp}
+          fallback={<box height={1} flexShrink={0} />}
+        >
+          <text height={1} flexShrink={0} fg={color.muted}>
+            {`Follow-up to: ${state().followUp?.term}`}
+          </text>
+        </Show>
+        <Show when={choosingEffort()}>
+          <box flexDirection="column" flexShrink={0} paddingBottom={1}>
+            <text fg={color.ink}>Research effort · USD per lookup</text>
+            <For each={EFFORT_LEVELS}>
+              {(level) => (
+                <text
+                  id={`effort-${level}`}
+                  fg={pendingEffort() === level ? color.patina : color.muted}
+                  onMouseDown={() => applyEffort(level)}
+                >
+                  {`${pendingEffort() === level ? "›" : " "} ${level.padEnd(6)}  ${EFFORT_PROFILES[level].usualSeconds}s  ${EFFORT_PROFILES[level].cost}${level === effort() ? " (current)" : ""}`}
+                </text>
+              )}
+            </For>
+            <text fg={color.muted} wrapMode="word">
+              {props.demo
+                ? "Demo only · no requests or charges."
+                : "Changing effort does not send your query."}
+            </text>
+          </box>
+        </Show>
         <scrollbox
           id="reader"
           ref={(element) => {
@@ -288,10 +428,13 @@ export function App(props: AppProps) {
                 fg={color.patina}
               >{`Looking up ${parsed().term}…  ${elapsed()}s`}</text>
               <text fg={color.muted} wrapMode="word">
-                Parallel is researching your term and preparing a cited
-                synthesis.
+                {state().followUp
+                  ? "Parallel is researching your follow-up using the conversation context."
+                  : "Parallel is researching your term and preparing a cited synthesis."}
               </text>
-              <text fg={color.muted}>A lookup usually takes 5–10 seconds.</text>
+              <text fg={color.muted}>
+                {`A ${effort()} lookup usually takes ${EFFORT_PROFILES[effort()].usualSeconds} seconds.`}
+              </text>
             </Show>
             <Show when={lookupError()}>
               <text fg={color.rust} wrapMode="word">
@@ -306,18 +449,32 @@ export function App(props: AppProps) {
                   The previous lookup is still in memory:
                 </text>
                 <text fg={color.ink} wrapMode="word">
-                  {formatQuery(state().entry!.term, state().entry!.context)}
+                  {entryQuery(state().entry!)}
                 </text>
               </Show>
             </Show>
             <Show when={!state().entry && !state().busy && !lookupError()}>
-              <text fg={color.muted} wrapMode="word">
-                Type what you want to understand. If the term is ambiguous, add
-                the topic after a colon:
-              </text>
-              <text fg={color.ink}>
-                {"entropy : information theory\ncoherence : quantum mechanics"}
-              </text>
+              <Show
+                when={state().followUp}
+                fallback={
+                  <>
+                    <text fg={color.muted} wrapMode="word">
+                      Type what you want to understand. If the term is
+                      ambiguous, add the topic after a colon:
+                    </text>
+                    <text fg={color.ink}>
+                      {
+                        "entropy : information theory\ncoherence : quantum mechanics"
+                      }
+                    </text>
+                  </>
+                }
+              >
+                <text fg={color.muted} wrapMode="word">
+                  Ask a follow-up. The conversation context is kept. Nothing is
+                  sent until you press Enter.
+                </text>
+              </Show>
               <text fg={color.muted} wrapMode="word">
                 minser answers with a synthesis and the citations it rests on.
               </text>
@@ -347,7 +504,7 @@ export function App(props: AppProps) {
                   <text
                     fg={color.muted}
                     wrapMode="word"
-                  >{`Previous lookup: ${formatQuery(state().entry!.term, state().entry!.context)}`}</text>
+                  >{`Previous lookup: ${entryQuery(state().entry!)}`}</text>
                 </Show>
                 <text fg={color.ink} wrapMode="word">
                   <For each={state().entry!.text.split(/([¹²³⁴⁵]+)/)}>
@@ -367,9 +524,43 @@ export function App(props: AppProps) {
                 <box flexDirection="row" height={1} flexShrink={0} gap={1}>
                   <text fg={color.patina}>according to</text>
                   <text fg={color.verdigris}>
-                    {"─".repeat(Math.max(1, width() - 13))}
+                    {"─".repeat(
+                      Math.max(1, width() - (canFollowUp() ? 31 : 19)),
+                    )}
+                  </text>
+                  <Show when={canFollowUp()}>
+                    <text
+                      id="follow-up-control"
+                      fg={state().busy ? color.muted : color.patina}
+                      onMouseDown={(event) => {
+                        // Keep the renderer's default click focus from stealing
+                        // focus from the query field opened by this action.
+                        event.preventDefault();
+                        event.stopPropagation();
+                        followUp();
+                      }}
+                    >
+                      f follow up
+                    </text>
+                  </Show>
+                  <text
+                    id="new-lookup-control"
+                    fg={state().busy ? color.muted : color.patina}
+                    onMouseDown={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      newLookup();
+                    }}
+                  >
+                    n new
                   </text>
                 </box>
+                <Show when={!canFollowUp()}>
+                  <text fg={color.muted} wrapMode="word">
+                    Follow-up unavailable: no response ID. Press n for a new
+                    lookup.
+                  </text>
+                </Show>
                 <For each={sources()}>
                   {(source, index) => (
                     <box
